@@ -1,0 +1,64 @@
+# DFM 可制造性检查 — 阈值配置
+# 按 process 切换：FDM（熔融沉积） / SLA（光固化）
+# 用法：DFMRules(config_path) → rules.get('min_wall_thickness')
+
+process: FDM  # FDM | SLA
+
+# ── 打印机硬件参数 ──
+printer:
+  nozzle_diameter: 0.4       # mm，喷嘴直径
+  layer_height: 0.2          # mm，层高
+  build_volume: [220, 220, 250]  # mm，最大成型尺寸 [X, Y, Z]
+
+# ── 壁厚与结构 ──
+wall:
+  min_wall_thickness: 1.2    # mm，最小壁厚（FDM = 喷嘴×3，SLA = 0.5~0.8）
+  min_feature_size: 0.4      # mm，最小特征尺寸（= 喷嘴直径）
+  max_slenderness_ratio: 12  # 细长比上限（高度/最小宽度），超过变形风险
+  lattice_min_wall: 0.8      # mm，镂空点阵壁厚下限
+
+# ── 悬垂与支撑 ──
+overhang:
+  critical_angle: 45         # 度，朝下面法线与-Z轴夹角小于此值视为悬垂；竖直侧壁不算
+  max_overhang_area_ratio: 0.30  # 非底面悬垂面积占总表面积的阻断阈值
+  min_contact_area: 3.0      # mm²，最小支撑接触面积
+  bridge_max_span: 15.0      # mm，桥接最大跨度（FDM独有）
+
+# ── 空腔 ──
+cavity:
+  min_cavity_volume: 1.0     # mm³，忽略小于此体积的封闭空腔
+  sdf_pitch: 1.5             # mm，SDF 体素边长（越小越精确越慢，≤0.3 注意内存）
+  require_drain_hole: false  # 光固化中空模型必须排液孔（SLA 模式自动开启）
+
+# ── 尺寸与装配 ──
+dimension:
+  min_hole_diameter: 0.4     # mm，最小内孔直径（= 喷嘴直径）
+  gap_threshold: 0.25        # mm，装配间隙下限（小于此值粘连）
+  min_thread_pitch: 0.6      # mm，最小可打印螺纹牙距
+
+# ── 平台贴合 ──
+platform:
+  min_bottom_area: 5.0       # mm²，底面最小接触面积
+  z_tolerance: 0.00001       # mm，Z 向容差
+
+# ── 本地/服务器性能护栏 ──
+performance:
+  wall_sample_count: 800          # 壁厚射线采样数；服务器可按模型复杂度上调
+  self_intersection_max_faces: 200000  # 超过后返回 UNKNOWN，交由异步服务器任务处理
+
+# ── 评分权重 ──
+scoring:
+  watertight_topology: 25
+  wall_thickness: 25
+  overhang_support: 20
+  dimension_compliance: 15
+  feature_structure: 10
+  cavity: 5
+
+# ── SLA 光固化覆盖项（process: SLA 时生效） ──
+sla_overrides:
+  min_wall_thickness: 0.6
+  min_feature_size: 0.3
+  critical_angle: 30
+  require_drain_hole: true
+  layer_height: 0.05

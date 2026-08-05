@@ -40,6 +40,34 @@ dimension:
 platform:
   min_bottom_area: 5.0       # mm²，底面最小接触面积
   z_tolerance: 0.00001       # mm，Z 向容差
+  normalized_up_axis: y      # Hunyuan3D 归一化输出采用 Y-up；打印坐标统一转换为 Z-up
+
+# ── 自动修复参数 ──
+repair:
+  repair_stage_timeout_seconds: 120 # 每个隔离修复阶段的硬超时；超时保留最后有效网格
+  merge_close_tolerance: 0.01    # mm，仅合并此距离内的顶点，禁止使用库默认相对阈值
+  max_hole_edges: 30             # 补洞边界的最大边数，不是毫米/半径
+  meshfix_timeout_seconds: 120   # MeshFix 单任务超时
+  pedestal_style: auto           # auto | disc | block
+  pedestal_margin_mm: 2.0        # 底座相对支撑轮廓的水平外扩量
+  pedestal_thickness_mm: 2.0     # 平台以下的主体厚度
+  pedestal_taper_angle_deg: 60   # 侧壁相对水平面的角度，90 为垂直
+  pedestal_attachment_overlap_mm: 0.4  # 向模型内部伸入，保证布尔并集存在实体交叠
+  pedestal_contact_band_mm: 0.4  # 最低点以上用于估计脚部/支撑轮廓的高度带
+  pedestal_max_dimension_mm: 180 # 自动底座 X/Y 任一方向的最大尺寸
+  pedestal_voxel_pitch_mm: 0.4   # mini 环境无布尔后端时的体素融合基础精度
+  pedestal_voxel_max_cells: 12000000 # 体素融合内存护栏，超限时自动增大 pitch
+  pedestal_allow_voxel_fallback: true # 完整版服务器安装 manifold3d 后可关闭
+  stability_margin_mm: 1.0       # 重心投影距支撑多边形边界的最小安全裕量
+  fragment_max_ratio: 0.01       # 自动删除必须同时低于主体表面积的 1%
+  fragment_max_area_mm2: 10.0    # 自动删除必须同时低于此绝对表面积
+  fragment_max_extent_mm: 2.0    # 自动删除必须同时满足最长边小于此值
+  fragment_protect_distance_mm: 0.2 # 距主体过近或 AABB 相交时保护，交给融合/人工复核
+
+# ── CuraEngine FDM 切片仿真 ──
+slicer:
+  cura_timeout_seconds: 120      # 本地同步切片超时；服务器异步任务可覆盖
+  filament_density_g_cm3: 1.24   # PLA 参考密度，仅用于耗材质量估算
 
 # ── 本地/服务器性能护栏 ──
 performance:

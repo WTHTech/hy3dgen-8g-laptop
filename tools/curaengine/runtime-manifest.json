@@ -1,0 +1,14 @@
+{
+  "cura_version": "5.13.0",
+  "platform": "windows-x64",
+  "cache_directory": ".cache/tools/curaengine/5.13.0/windows-x64",
+  "release_page": "https://github.com/Ultimaker/Cura/releases/tag/5.13.0",
+  "engine": {
+    "file": "CuraEngine.exe",
+    "sha256": "36e36d4618cd09a0cd8802a565c2cdbe54804eb750ac84303a0c6d6f784afde2"
+  },
+  "installer": {
+    "file": "UltiMaker-Cura-5.13.0-win64-X64.exe",
+    "sha256": "6edb3c4394e6e4ecb6b00f3e96d70e1ea53652c57a9626b58f8fda56e291aa6d"
+  }
+}

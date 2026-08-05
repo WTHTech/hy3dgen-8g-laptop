@@ -18,6 +18,9 @@
 - ✅ 分阶段 CPU Offload 显存管理（Shape/Texture 模型不共存）
 - ✅ STL / OBJ / GLB 三格式导出
 - ✅ 固定 seed 复现 + 轻量回归测试
+- ✅ DFM 快速检查、分级修复与复检闭环基础版
+- ✅ `prepared_mesh` 毫米导出链路（非 PASS 默认阻断）
+- ✅ CuraEngine 5.13 FDM 切片仿真（毫米门禁、层数/耗时/耗材解析）
 
 ### 规划中的核心创新
 
@@ -39,6 +42,7 @@
 | **3D 生成引擎** | [Tencent Hunyuan3D-2mini](https://github.com/Tencent/Hunyuan3D-2)（图生 Shape） |
 | **深度学习框架** | PyTorch 2.x + CUDA 12.8 |
 | **网格处理** | trimesh, PyMeshLab |
+| **FDM 切片仿真** | CuraEngine 5.13 CLI |
 | **显存管理** | accelerate CPU Offload |
 | **测试框架** | pytest, unittest |
 | **目标部署** | AutoDL / 恒源云 GPU + 本地 RTX 5060 兜底 |
@@ -75,7 +79,7 @@ conda activate hy3d
 pip install -r Hunyuan3D-2/requirements.txt
 
 # 本项目额外依赖
-pip install accelerate trimesh pymeshlab pillow
+pip install accelerate trimesh pymeshlab pillow "openai>=2.36,<3" "httpx>=0.27,<1"
 ```
 
 ### 4. 下载模型权重
@@ -132,6 +136,13 @@ mesh = gen.generate_shape(image='your_image.png', seed=0)
 gen.export_stl(mesh, 'output/output.stl')
 gen.export_glb(mesh, 'output/output.glb')
 
+# DFM 标准化后的安全导出（只有最终快速报告 PASS 才写文件）
+result = gen.image_to_prepared_3d(
+    image='input.png', target_height=100,
+    export_stl='output/prepared.stl',
+)
+print(result['report'].status, result['exported_paths'])
+
 # 查看状态
 gen.memory_status()
 ```
@@ -147,13 +158,18 @@ gen.memory_status()
 ├── scripts/
 │   └── inference.py              # ★ 核心封装：分阶段推理 + CPU Offload
 ├── tests/
-│   └── test_inference_lightweight.py
-├── dfm/                           # DFM 检查模块（待开发）
+│   ├── test_inference_lightweight.py
+│   ├── test_dfm.py
+│   ├── test_repair.py
+│   └── test_slicer.py
+├── dfm/                           # DFM 检查、修复复检、Cura 切片仿真
+├── tools/curaengine/              # Cura 版本/哈希清单；运行时存放在 .cache/
 ├── docs/
-│   ├── 项目方案.md                # 完整方案与路线图
-│   ├── 进度跟踪.md                # 实时进度记录
-│   ├── 参考文献.md                # 必读论文清单
-│   └── 开源项目调研.md            # 竞品分析
+│   ├── AI 文创手办 3D 生成与打印系统 项目方案.md  # 完整方案与路线图
+│   ├── 项目进度跟踪.md            # 实时进度记录
+│   ├── DFM可制造性检查.md         # 当前 DFM 任务说明
+│   ├── 重点阅读文献.md            # 必读论文清单
+│   └── 参考开源项目.md            # 竞品分析
 ├── Hunyuan3D-2/                   # Git Submodule → Tencent/Hunyuan3D-2
 ├── models/                        # 模型权重（本地，不提交 Git）
 ├── output/                        # 生成结果（本地，不提交 Git）
@@ -168,7 +184,7 @@ gen.memory_status()
 |------|------|:----:|
 | Phase 0 | 本地环境 + CUDA + 模型导入 | ✅ |
 | Phase 1 | 单图生无纹理 3D + 三格式导出冒烟验收 | ✅ |
-| Phase 2 | DFM 工具集成与可打印性验证 | 🔲 |
+| Phase 2 | DFM 工具集成与可打印性验证 | 🔄 |
 | Phase 3 | 图生 3D MVP 完整性验证（10+ 测试图） | 🔲 |
 | Phase 4 | 云端 Hunyuan3D-2 完整版部署 | 🔲 |
 | Phase 5 | 全链路跑通（生成→DFM→修复→切片→打印） | 🔲 |
@@ -185,6 +201,7 @@ gen.memory_status()
 - 本项目的自有代码（`scripts/`、`tests/`、`dfm/`）采用 [MIT License](LICENSE)
 - 依赖的 Hunyuan3D-2 使用 [Tencent Hunyuan 3D 2.0 Community License](https://github.com/Tencent/Hunyuan3D-2/blob/main/LICENSE)，请注意其使用限制（不适用于欧盟/英国/韩国，月活 >100 万需额外许可）
 - `docs/` 中的方案与调研文档为项目参考资料
+- CuraEngine 使用 GNU AGPLv3；当前运行时不提交仓库，修改或服务器使用前需完成许可证合规确认
 
 ---
 

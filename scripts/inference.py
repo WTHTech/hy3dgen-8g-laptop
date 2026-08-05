@@ -29,6 +29,7 @@ import sys
 from pathlib import Path
 
 import torch
+import trimesh
 from PIL import Image
 
 # ── 路径设置 ─────────────────────────────────────────────
@@ -424,57 +425,130 @@ class Hunyuan3DGenerator:
 
     # ── 导出接口 ──────────────────────────────────────
 
-    def export_stl(self, mesh, output_path):
-        """导出 STL 格式（无纹理，直接可用于切片打印）
+    @staticmethod
+    def _extract_mesh(mesh_or_report, *, allow_failed=False):
+        """从 trimesh.Trimesh 或 DFMReport 中提取 prepared_mesh。
+
+        传入 DFMReport 时自动使用标准化后的毫米网格，并在日志中标注
+        物理尺寸。这是 DFM 检查后推荐的导出方式。默认拒绝未通过的
+        报告；诊断场景必须显式传 ``allow_failed=True``。
+        """
+        from dfm import DFMReport
+
+        if not isinstance(allow_failed, bool):
+            raise TypeError('allow_failed 必须是布尔值')
+
+        if isinstance(mesh_or_report, DFMReport):
+            report = mesh_or_report
+            if report.status != 'PASS' and not allow_failed:
+                raise ValueError(
+                    f'DFM 状态为 {report.status}，拒绝导出；'
+                    '诊断导出必须显式传 allow_failed=True'
+                )
+            mesh = report.prepared_mesh
+            if mesh is None:
+                raise ValueError('DFMReport 中没有 prepared_mesh，请先运行 DFM 检查')
+            if not isinstance(mesh, trimesh.Trimesh):
+                raise TypeError('DFMReport.prepared_mesh 必须是 trimesh.Trimesh')
+            extents = mesh.extents
+            _log(
+                f'使用 DFM prepared_mesh: '
+                f'{extents[0]:.1f}×{extents[1]:.1f}×{extents[2]:.1f} mm'
+            )
+            return mesh
+        if isinstance(mesh_or_report, trimesh.Trimesh):
+            return mesh_or_report
+        raise TypeError(
+            f'导出目标必须是 trimesh.Trimesh 或 DFMReport，'
+            f'实际为 {type(mesh_or_report).__name__}'
+        )
+
+    @staticmethod
+    def _export_path(output_path, suffix):
+        """校验格式专用导出接口的路径，避免后缀决定出错误格式。"""
+        if not isinstance(output_path, (str, os.PathLike)):
+            raise TypeError('output_path 必须是字符串或 PathLike')
+        path = Path(output_path).expanduser()
+        if path.suffix.lower() != suffix:
+            raise ValueError(f'输出路径必须使用 {suffix} 后缀: {path}')
+        if path.exists() and path.is_dir():
+            raise ValueError(f'输出路径是目录: {path}')
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def export_stl(self, mesh_or_report, output_path, *, allow_failed=False):
+        """导出 STL 格式（无纹理；STL 坐标按毫米约定解释）
 
         Parameters
         ----------
-        mesh : trimesh.Trimesh
-            要导出的网格
+        mesh_or_report : trimesh.Trimesh or DFMReport
+            要导出的网格，或包含 prepared_mesh 的 DFM 报告。
+            传入 DFMReport 时自动使用标准化后的毫米网格。
         output_path : str or Path
             输出路径，.stl 后缀
+        allow_failed : bool
+            是否允许导出未通过的 DFM 报告，仅用于诊断。
         """
-        path = Path(output_path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        mesh.export(str(path))
+        mesh = self._extract_mesh(mesh_or_report, allow_failed=allow_failed)
+        path = self._export_path(output_path, '.stl')
+        mesh.export(str(path), file_type='stl')
         _log(f'STL 已导出: {path} ({len(mesh.faces)} 面, {len(mesh.vertices)} 顶点)')
+        return path
 
-    def export_obj(self, mesh, output_path):
-        """导出 OBJ 格式"""
-        path = Path(output_path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        mesh.export(str(path))
+    def export_obj(self, mesh_or_report, output_path, *, allow_failed=False):
+        """导出 OBJ 格式
+
+        Parameters
+        ----------
+        mesh_or_report : trimesh.Trimesh or DFMReport
+            要导出的网格或 DFM 报告。
+        output_path : str or Path
+            输出路径
+        allow_failed : bool
+            是否允许导出未通过的 DFM 报告，仅用于诊断。
+        """
+        mesh = self._extract_mesh(mesh_or_report, allow_failed=allow_failed)
+        path = self._export_path(output_path, '.obj')
+        mesh.export(str(path), file_type='obj')
         _log(f'OBJ 已导出: {path}')
+        return path
 
-    def export_glb(self, mesh, output_path, with_texture=False, image=None):
+    def export_glb(self, mesh_or_report, output_path,
+                   with_texture=False, image=None, *, allow_failed=False):
         """导出 GLB 格式
 
         Parameters
         ----------
-        mesh : trimesh.Trimesh
-            基础网格
+        mesh_or_report : trimesh.Trimesh or DFMReport
+            基础网格或 DFM 报告。
         output_path : str or Path
             输出路径
         with_texture : bool
             是否先生成纹理再导出（会额外加载纹理模型）
         image : PIL.Image or str
             纹理参考图（with_texture=True 时必需）
+        allow_failed : bool
+            是否允许导出未通过的 DFM 报告，仅用于诊断。
         """
+        mesh = self._extract_mesh(mesh_or_report, allow_failed=allow_failed)
         if with_texture:
             if image is None:
                 raise ValueError('with_texture=True 时需要提供 image 参数')
             mesh = self.generate_texture(mesh, image)
 
-        path = Path(output_path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        mesh.export(str(path))
+        path = self._export_path(output_path, '.glb')
+        mesh.export(str(path), file_type='glb')
         _log(f'GLB 已导出: {path} (纹理: {with_texture})')
+        return path
 
     # ── 便捷的全流程接口 ──────────────────────────────
 
     def image_to_3d(self, image, export_stl=None, export_glb=None,
                     with_texture=False, **shape_kwargs):
-        """图生 3D 一站式接口
+        """图生 3D 一站式接口（无 DFM，导出原始归一化网格）
+
+        如需导出经过 DFM 标准化的毫米候选网格，请使用
+        :meth:`image_to_prepared_3d`。
 
         Parameters
         ----------
@@ -496,16 +570,196 @@ class Hunyuan3DGenerator:
         # 阶段1: 生成形状（Shape 模型加载→推理→卸载）
         mesh = self.generate_shape(image, **shape_kwargs)
 
-        # 阶段2: 导出 STL（不需要纹理模型）
+        # 阶段2: 导出（使用原始归一化网格）
         if export_stl:
             self.export_stl(mesh, export_stl)
-
-        # 阶段3: 导出 GLB（可选纹理，独立加载/卸载纹理模型）
         if export_glb:
             self.export_glb(mesh, export_glb,
                            with_texture=with_texture, image=image)
 
         return mesh
+
+    def image_to_prepared_3d(
+        self, image,
+        target_height=100.0,
+        export_stl=None,
+        export_glb=None,
+        with_texture=False,
+        dfm_rules=None,
+        auto_repair=True,
+        allow_failed_export=False,
+        image_preprocessor=None,
+        image_preprocess_options=None,
+        preprocess_output_dir=None,
+        **shape_kwargs,
+    ):
+        """图生 3D → DFM 快速检查 → 修复 → 导出毫米候选网格。
+
+        与 ``image_to_3d`` 的区别：
+        - 导出的 STL/GLB 是经过单位标准化（毫米）和 Z=0 放置的物理网格
+        - 自动运行 DFM 粗筛，可选修复闭环
+        - 默认只有最终快速报告 PASS 才导出
+        - 返回包含最后复检报告、修复记录和导出状态的完整上下文
+
+        快速层 PASS 只表示网格已经准备好进入精检与切片，不代表已完成
+        目标打印机 profile 的可打印性验证。
+
+        Parameters
+        ----------
+        image : str, Path, or PIL.Image
+            输入图片
+        target_height : float
+            目标模型高度(mm)，默认 100mm 手办尺寸
+        export_stl : str or Path, optional
+            STL 输出路径（导出 prepared_mesh）
+        export_glb : str or Path, optional
+            GLB 输出路径
+        with_texture : bool
+            GLB 是否带纹理
+        dfm_rules : DFMRules, optional
+            DFM 规则配置；不提供则使用默认 FDM 配置
+        auto_repair : bool
+            是否在 DFM 检查失败后自动尝试修复闭环
+        allow_failed_export : bool
+            是否允许导出未通过 DFM 的网格，仅用于诊断，默认 False
+        image_preprocessor : PedestalImagePreprocessor, optional
+            可选的图像底座预处理器；不提供时保持原有流程，不调用外部服务。
+        image_preprocess_options : PreprocessOptions, optional
+            传给图像预处理器的策略和提供方参数。
+        preprocess_output_dir : str or Path, optional
+            原图、蒙版、派生图和 manifest 的保存目录。启用预处理时必填。
+        **shape_kwargs
+            传给 generate_shape 的参数
+
+        Returns
+        -------
+        dict
+            {'mesh': 原始 Trimesh, 'report': DFMReport,
+             'repair_result': RepairResult or None,
+             'prepared_mesh': 最终报告对应的毫米网格,
+             'ready_for_slicing': 是否通过快速层,
+             'printable_verified': False,
+             'exported_paths': 实际写出的文件,
+             'export_blocked_reason': 未导出原因}
+        """
+        from dfm import DFMChecker, DFMRepairer, DFMRules
+
+        if not isinstance(auto_repair, bool):
+            raise TypeError('auto_repair 必须是布尔值')
+        if not isinstance(allow_failed_export, bool):
+            raise TypeError('allow_failed_export 必须是布尔值')
+
+        preprocess_result = None
+        generation_image = image
+        if image_preprocessor is not None:
+            if not hasattr(image_preprocessor, 'process'):
+                raise TypeError('image_preprocessor 必须实现 process')
+            if preprocess_output_dir is None:
+                raise ValueError(
+                    '启用 image_preprocessor 时必须提供 preprocess_output_dir'
+                )
+            preprocess_result = image_preprocessor.process(
+                image,
+                preprocess_output_dir,
+                image_preprocess_options,
+            )
+            selected = getattr(
+                preprocess_result, 'selected_image_path', None,
+            )
+            if selected is None:
+                raise ValueError('图像预处理结果没有 selected_image_path')
+            selected = Path(selected)
+            if not selected.is_file():
+                raise FileNotFoundError(f'预处理选定图片不存在: {selected}')
+            generation_image = selected
+            _log(f'图像预处理完成，生成输入: {selected}')
+
+        rules = dfm_rules if dfm_rules is not None else DFMRules()
+        if not isinstance(rules, DFMRules):
+            raise TypeError('dfm_rules 必须是 DFMRules 或 None')
+        checker = DFMChecker(rules)
+
+        # 阶段1: 生成形状
+        mesh = self.generate_shape(generation_image, **shape_kwargs)
+
+        # 阶段2: DFM 粗筛（标准化 → 毫米）
+        report = checker.check_quick(
+            mesh, target_height=target_height, input_units='normalized',
+        )
+        _log(f'DFM 粗筛: {report.status}, 评分 {report.total_score:.0f}')
+
+        # 阶段3: 修复闭环（可选）
+        repair_result = None
+        if report.status == 'FAIL' and auto_repair and report.prepared_mesh is not None:
+            repairer = DFMRepairer(rules=rules)
+            repair_result, final_report = repairer.repair_and_recheck(
+                report.prepared_mesh, checker, target_height=target_height,
+                input_units='mm',
+            )
+            _log(f'修复: {repair_result.summary}')
+            # 无论修复是否成功，都保留最后一次复检报告，避免报告与网格错位。
+            report = final_report
+        elif report.status == 'INCOMPLETE' and auto_repair:
+            _log('DFM 检查未完成，跳过几何修复并等待异步/人工复核')
+
+        # 最终报告中的 prepared_mesh 是返回、导出和后续切片的唯一对象。
+        export_mesh = report.prepared_mesh
+        requested_export = bool(export_stl or export_glb)
+        exported_paths = {}
+        export_blocked_reason = ''
+        can_export = export_mesh is not None and (
+            report.status == 'PASS' or allow_failed_export
+        )
+
+        if requested_export and not can_export:
+            if export_mesh is None:
+                export_blocked_reason = '最终 DFM 报告没有 prepared_mesh，未导出'
+            else:
+                export_blocked_reason = (
+                    f'最终 DFM 状态为 {report.status}，未导出；'
+                    '诊断时可显式传 allow_failed_export=True'
+                )
+            _log(export_blocked_reason)
+        elif requested_export:
+            if export_stl:
+                path = self.export_stl(
+                    report, export_stl, allow_failed=allow_failed_export,
+                )
+                exported_paths['stl'] = str(path.resolve())
+            if export_glb:
+                path = self.export_glb(
+                    report, export_glb,
+                    with_texture=with_texture, image=generation_image,
+                    allow_failed=allow_failed_export,
+                )
+                exported_paths['glb'] = str(path.resolve())
+
+        return {
+            'mesh': mesh,
+            'report': report,
+            'repair_result': repair_result,
+            'prepared_mesh': export_mesh,
+            'verification_scope': 'quick',
+            'ready_for_slicing': report.status == 'PASS',
+            # 目标打印机 profile 切片尚未在此方法中执行，不能宣称已可直接打印。
+            'printable_verified': False,
+            'exported_paths': exported_paths,
+            'export_blocked_reason': export_blocked_reason,
+            'preprocess_result': preprocess_result,
+            'generation_image': (
+                str(Path(generation_image).resolve())
+                if isinstance(generation_image, (str, os.PathLike))
+                else '<PIL.Image>'
+            ),
+        }
+
+    def image_to_printable_3d(self, *args, **kwargs):
+        """兼容旧调用；正式入口请使用 :meth:`image_to_prepared_3d`。
+
+        该别名不会改变验证语义：返回结果仍只是通过 DFM 快速层的切片候选，
+        ``printable_verified`` 保持为 False。
+        """
+        return self.image_to_prepared_3d(*args, **kwargs)
 
     # ── 显存状态查询 ──────────────────────────────────
 
@@ -545,15 +799,32 @@ if __name__ == '__main__':
     gen = Hunyuan3DGenerator(variant='turbo')
     gen.memory_status()
 
-    # 如果有测试图片，跑一次生成
+    # 如果有测试图片，跑一次全流程生成
     test_img = PROJECT_ROOT / 'Hunyuan3D-2' / 'assets' / 'demo.png'
     if test_img.exists():
-        print(f'\n── 测试生成: {test_img} ──')
-        mesh = gen.generate_shape(image=str(test_img))
-        print(f'  结果: {len(mesh.vertices)} 顶点, {len(mesh.faces)} 面')
-
-        out_stl = str(OUTPUT_DIR / 'test_output.stl')
-        gen.export_stl(mesh, out_stl)
+        print(f'\n── 测试生成 + DFM + 导出: {test_img} ──')
+        result = gen.image_to_prepared_3d(
+            image=str(test_img),
+            target_height=100,
+            export_stl=str(OUTPUT_DIR / 'test_physical.stl'),
+            export_glb=str(OUTPUT_DIR / 'test_physical.glb'),
+            seed=0,
+        )
+        raw = result['mesh']
+        prepared = result['prepared_mesh']
+        report = result['report']
+        print(f'  原始网格: {len(raw.vertices)} 顶点, {len(raw.faces)} 面')
+        if prepared is not None:
+            print(f'  标准化后: {len(prepared.vertices)} 顶点, '
+                  f'{prepared.extents[0]:.0f}×{prepared.extents[1]:.0f}×{prepared.extents[2]:.0f} mm')
+        else:
+            print('  标准化后: 无可用 prepared_mesh')
+        print(f'  DFM 状态: {report.status}, 评分 {report.total_score:.0f}')
+        for format_name, path in result['exported_paths'].items():
+            print(f'  {format_name.upper()} → {path}')
+        if result['export_blocked_reason']:
+            print(f"  导出阻断: {result['export_blocked_reason']}")
+        print(f"  可进入切片: {'是' if result['ready_for_slicing'] else '否'}")
         gen.memory_status()
     else:
         print(f'\n测试图片不存在: {test_img}')

@@ -18,15 +18,35 @@ class DFMGeometryTests(unittest.TestCase):
         self.checker = DFMChecker(DFMRules())
 
     def test_normalized_mesh_is_scaled_and_same_mesh_is_used_by_full_check(self):
-        source = trimesh.creation.box(extents=[0.1, 0.1, 2.0])
+        source = trimesh.creation.box(extents=[0.1, 2.0, 0.1])
 
-        report = self.checker.check_full(source, target_height=100.0)
+        report = self.checker.check_full(
+            source, target_height=100.0, input_units='normalized',
+        )
 
         self.assertIsNot(report.prepared_mesh, source)
         np.testing.assert_allclose(report.prepared_mesh.extents, [5.0, 5.0, 100.0])
         self.assertAlmostEqual(report.prepared_mesh.bounds[0, 2], 0.0)
         self.assertAlmostEqual(by_code(report, 'W1').metrics['thickness_p5'], 5.0)
-        np.testing.assert_allclose(source.extents, [0.1, 0.1, 2.0])
+        np.testing.assert_allclose(source.extents, [0.1, 2.0, 0.1])
+
+    def test_hunyuan_y_up_mesh_is_oriented_before_target_height_scaling(self):
+        """Hunyuan 的 Y 轴是高度，不能把很薄的 Z 轴放大到目标高度。"""
+        source = trimesh.creation.box(extents=[0.8, 2.0, 0.2])
+
+        report = self.checker.check_quick(
+            source, target_height=100.0, input_units='normalized',
+        )
+
+        np.testing.assert_allclose(
+            report.prepared_mesh.extents, [40.0, 10.0, 100.0], atol=1e-8,
+        )
+        self.assertAlmostEqual(report.prepared_mesh.bounds[0, 2], 0.0)
+        p0 = by_code(report, 'P0')
+        self.assertEqual(p0.metrics['source_up_axis'], 'y')
+        self.assertEqual(p0.metrics['print_up_axis'], 'z')
+        self.assertAlmostEqual(p0.metrics['final_height'], 100.0)
+        np.testing.assert_allclose(source.extents, [0.8, 2.0, 0.2])
 
     def test_cube_vertical_walls_are_not_overhangs(self):
         report = self.checker.check_quick(trimesh.creation.box(extents=[20, 20, 20]))
@@ -34,6 +54,60 @@ class DFMGeometryTests(unittest.TestCase):
         result = by_code(report, 'S1')
         self.assertEqual(result.status, CheckStatus.PASS)
         self.assertAlmostEqual(result.metrics['overhang_ratio'], 0.0)
+        self.assertEqual(by_code(report, 'P3').status, CheckStatus.PASS)
+
+    def test_top_heavy_offset_model_fails_static_stability(self):
+        """底面积达标不代表稳定，重心投影越出支撑区必须触发 P3。"""
+        foot = trimesh.creation.box([4, 4, 4])
+        foot.apply_translation([0, 0, 2])
+        upper = trimesh.creation.box([10, 4, 10])
+        upper.apply_translation([8, 0, 9])
+        model = trimesh.util.concatenate([foot, upper])
+
+        report = self.checker.check_quick(model, input_units='mm')
+
+        self.assertEqual(by_code(report, 'P1').status, CheckStatus.PASS)
+        stability = by_code(report, 'P3')
+        self.assertEqual(stability.status, CheckStatus.FAIL)
+        self.assertLess(stability.metrics['stability_margin_mm'], 0.0)
+
+    def test_small_mm_mesh_is_never_silently_scaled(self):
+        source = trimesh.creation.box(extents=[2, 2, 2])
+
+        ambiguous = self.checker.check_quick(source)
+        physical = self.checker.check_quick(source, input_units='mm')
+
+        self.assertEqual(ambiguous.status, 'INCOMPLETE')
+        self.assertIsNone(ambiguous.prepared_mesh)
+        np.testing.assert_allclose(physical.prepared_mesh.extents, [2, 2, 2])
+
+    def test_separated_point_contacts_do_not_form_fake_contact_area(self):
+        parts = []
+        for x, y in [(0, 0), (10, 0), (0, 10)]:
+            sphere = trimesh.creation.icosphere(subdivisions=2, radius=1.0)
+            sphere.apply_translation([x, y, 1.0])
+            parts.append(sphere)
+        mesh = trimesh.util.concatenate(parts)
+
+        report = self.checker.check_quick(mesh, input_units='mm')
+
+        result = by_code(report, 'P1')
+        self.assertEqual(result.status, CheckStatus.FAIL)
+        self.assertEqual(result.metrics['contact_area'], 0.0)
+
+    def test_equal_sized_floating_component_fails_g6(self):
+        lower = trimesh.creation.box([10, 10, 10])
+        lower.apply_translation([0, 0, 5])
+        upper = trimesh.creation.box([10, 10, 10])
+        upper.apply_translation([0, 0, 25])
+
+        report = self.checker.check_quick(
+            trimesh.util.concatenate([lower, upper]), input_units='mm',
+        )
+
+        result = by_code(report, 'G6')
+        self.assertEqual(result.status, CheckStatus.FAIL)
+        self.assertEqual(result.metrics['floating_component_count'], 1)
 
     def test_elevated_horizontal_plate_is_overhang(self):
         plate = trimesh.creation.box(extents=[40, 40, 2])

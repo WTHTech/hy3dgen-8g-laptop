@@ -126,7 +126,7 @@ class DFMChecker:
         rules = DFMRules('dfm_config.yaml')
         checker = DFMChecker(rules)
         mesh = trimesh.load('model.stl')
-        report = checker.check_quick(mesh)
+        report = checker.check_quick(mesh, input_units='mm')
         if report.passed:
             print(f'粗筛通过，总分 {report.total_score:.0f}')
         else:
@@ -141,8 +141,9 @@ class DFMChecker:
     # ── 入口 ──────────────────────────────────────────
 
     def check_quick(self, mesh: trimesh.Trimesh,
-                    target_height: float = 100.0) -> DFMReport:
-        """执行 10 项快速粗筛（P0~P2、G1~G6、S1）。
+                    target_height: float = 100.0,
+                    input_units: str = 'auto') -> DFMReport:
+        """执行 11 项快速粗筛（P0~P3、G1~G6、S1）。
 
         Parameters
         ----------
@@ -150,6 +151,9 @@ class DFMChecker:
             待检查网格
         target_height : float
             P0 单位标准化的目标高度(mm)，默认 100mm 手办尺寸
+        input_units : {'auto', 'mm', 'normalized'}
+            ``normalized`` 用于 AI 归一化输出，``mm`` 用于已有物理模型。
+            ``auto`` 遇到小尺寸歧义时返回 INCOMPLETE，不会擅自放大。
 
         Returns
         -------
@@ -158,11 +162,12 @@ class DFMChecker:
         report = DFMReport()
 
         # ── 前置处理：返回的 prepared_mesh 才是后续检查和导出的唯一对象 ──
-        mesh = self._prepare_mesh(mesh, target_height, report)
+        mesh = self._prepare_mesh(mesh, target_height, report, input_units)
         if mesh is None:
             self._finalize_report(report)
             return report
         self._check_bottom_platform(mesh, report)
+        self._check_stability(mesh, report)
         self._check_build_volume(mesh, report)
 
         # ── 几何拓扑 ──
@@ -222,12 +227,13 @@ class DFMChecker:
         return report
 
     def check_full(self, mesh: trimesh.Trimesh,
-                   target_height: float = 100.0) -> DFMReport:
-        """执行全量检查：粗筛 10 项 + 精检 13 项，合并为一份报告。
+                   target_height: float = 100.0,
+                   input_units: str = 'auto') -> DFMReport:
+        """执行全量检查：粗筛 11 项 + 精检 13 项，合并为一份报告。
 
         粗筛任一阻断项失败则跳过精检，直接返回阻断报告。
         """
-        quick = self.check_quick(mesh, target_height)
+        quick = self.check_quick(mesh, target_height, input_units=input_units)
         if quick.status != 'PASS':
             quick.summary = 'BLOCKED: 粗筛阻断，跳过精检 — ' + quick.summary
             return quick
@@ -252,13 +258,22 @@ class DFMChecker:
         return None
 
     def _prepare_mesh(self, mesh: trimesh.Trimesh, target_height: float,
-                      report: DFMReport) -> Optional[trimesh.Trimesh]:
+                      report: DFMReport,
+                      input_units: str = 'auto') -> Optional[trimesh.Trimesh]:
         """复制、验证网格，将归一化模型缩放至毫米并放置到 Z=0。"""
         error = self._mesh_validation_error(mesh)
         if error:
             report.results.append(CheckResult(
                 code='P0', name='单位与输入标准化', category='precheck',
                 passed=False, score=0, detail=error,
+            ))
+            return None
+        mode = str(input_units).strip().lower()
+        if mode not in {'auto', 'mm', 'normalized'}:
+            report.results.append(CheckResult(
+                code='P0', name='单位与输入标准化', category='precheck',
+                passed=False, score=0,
+                detail=f'input_units 必须是 auto/mm/normalized，实际为 {input_units!r}',
             ))
             return None
         if not isinstance(target_height, (int, float)) or not np.isfinite(target_height) or target_height <= 0:
@@ -271,25 +286,54 @@ class DFMChecker:
 
         mesh = mesh.copy()
         bounds = mesh.bounds
-        current_h = bounds[1, 2] - bounds[0, 2]  # Z 轴高度
-        if not np.isfinite(bounds).all() or current_h <= 1e-9:
+        if not np.isfinite(bounds).all() or float(mesh.extents.max()) <= 1e-9:
             report.results.append(CheckResult(
                 code='P0', name='单位与输入标准化', category='precheck',
-                passed=False, score=0, detail='网格边界无效或 Z 轴高度为零',
+                passed=False, score=0, detail='网格边界无效或尺寸为零',
             ))
             return None
 
-        # 判定是否为归一化坐标：Z 高度 < 5 且整体范围 < 10
-        is_normalized = current_h < 5.0 and np.ptp(bounds) < 10.0
-        scale = float(target_height / current_h) if is_normalized else 1.0
+        current_h = float(mesh.extents[2])
+        looks_normalized = current_h < 5.0 and float(mesh.extents.max()) < 10.0
+        if mode == 'auto' and looks_normalized:
+            self._append_unknown(
+                report, 'P0', '单位标准化', 'precheck',
+                '小尺寸模型可能是毫米零件，也可能是归一化 AI 输出；请显式指定 input_units="mm" 或 "normalized"',
+                blocking=True,
+                metrics={'height': float(current_h),
+                         'extents': mesh.extents.tolist()},
+            )
+            return None
+        is_normalized = mode == 'normalized'
+        source_up_axis = 'z'
+        orientation = np.eye(4)
+        if is_normalized:
+            source_up_axis = str(
+                self.rules.get('normalized_up_axis', 'y')
+            ).strip().lower()
+            orientation = self._up_axis_to_z_transform(source_up_axis)
+            mesh.apply_transform(orientation)
+
+        oriented_h = float(mesh.extents[2])
+        if oriented_h <= 1e-9:
+            report.results.append(CheckResult(
+                code='P0', name='单位与输入标准化', category='precheck',
+                passed=False, score=0,
+                detail=f'{source_up_axis.upper()} 轴转换到打印 Z 轴后高度为零',
+            ))
+            return None
+
+        scale = float(target_height / oriented_h) if is_normalized else 1.0
         mesh.apply_scale(scale)
         min_z = float(mesh.bounds[0, 2])
         mesh.apply_translation([0, 0, -min_z])
         new_h = float(mesh.extents[2])
 
-        transform = np.eye(4)
-        transform[:3, :3] *= scale
-        transform[2, 3] = -min_z
+        scale_transform = np.eye(4)
+        scale_transform[:3, :3] *= scale
+        translation = np.eye(4)
+        translation[2, 3] = -min_z
+        transform = translation @ scale_transform @ orientation
         report.transform = transform.tolist()
         report.prepared_mesh = mesh
 
@@ -297,11 +341,20 @@ class DFMChecker:
             result = CheckResult(
                 code='P0', name='单位标准化', category='precheck',
                 passed=True, score=100,
-                detail=f'归一化坐标({current_h:.2f}) → 物理尺寸({new_h:.1f}mm)，比例 {scale:.1f}，已移至平台',
-                metrics={'original_height': float(current_h),
+                detail=(
+                    f'归一化 {source_up_axis.upper()}-up → 打印 Z-up，'
+                    f'高度 {oriented_h:.2f} → {new_h:.1f}mm，'
+                    f'比例 {scale:.1f}，已移至平台'
+                ),
+                metrics={'original_height': float(oriented_h),
                          'target_height': target_height,
                          'scale_factor': float(scale),
-                         'final_height': float(new_h)},
+                         'final_height': float(new_h),
+                         'source_up_axis': source_up_axis,
+                         'print_up_axis': 'z',
+                         'original_extents': np.asarray(bounds[1] - bounds[0]).tolist(),
+                         'final_extents': mesh.extents.tolist(),
+                         'input_units': mode},
             )
         else:
             result = CheckResult(
@@ -309,10 +362,36 @@ class DFMChecker:
                 passed=True, score=100,
                 detail=f'按毫米处理 (高度 {current_h:.1f}mm)，并移动至 Z=0 平台',
                 metrics={'height_mm': float(current_h),
-                         'scale_factor': 1.0, 'z_translation': -min_z},
+                         'scale_factor': 1.0, 'z_translation': -min_z,
+                         'input_units': 'mm' if mode == 'auto' else mode},
             )
         report.results.append(result)
         return mesh
+
+    @staticmethod
+    def _up_axis_to_z_transform(source_up_axis: str) -> np.ndarray:
+        """把源坐标的上方向旋转到打印坐标 Z 轴，不做镜像。"""
+        axis = str(source_up_axis).strip().lower()
+        transform = np.eye(4)
+        if axis == 'z':
+            return transform
+        if axis == 'y':
+            # 绕 X 轴 +90°：旧 Y → 新 Z，旧 Z → 新 -Y。
+            transform[:3, :3] = np.array([
+                [1.0, 0.0, 0.0],
+                [0.0, 0.0, -1.0],
+                [0.0, 1.0, 0.0],
+            ])
+            return transform
+        if axis == 'x':
+            # 绕 Y 轴 -90°：旧 X → 新 Z，旧 Z → 新 -X。
+            transform[:3, :3] = np.array([
+                [0.0, 0.0, -1.0],
+                [0.0, 1.0, 0.0],
+                [1.0, 0.0, 0.0],
+            ])
+            return transform
+        raise ValueError(f'不支持的源上方向: {source_up_axis!r}')
 
     # ── P1: 底面平台 ──────────────────────────────────
 
@@ -335,27 +414,27 @@ class DFMChecker:
             ))
             return
 
-        # 提取底面附近顶点 → 投影 → 凸包面积
-        bottom_mask = mesh.vertices[:, 2] <= min_z + eps
-        if bottom_mask.sum() < 3:
+        # 只统计真正共面的底部三角面。最低点/最低边不具有可承载面积，
+        # 不能把分散接触点的凸包当作实际接触面积。
+        face_z = mesh.vertices[mesh.faces][:, :, 2]
+        bottom_faces = np.all(np.abs(face_z - min_z) <= eps, axis=1)
+        bottom_count = int(bottom_faces.sum())
+        if bottom_count == 0:
             report.results.append(CheckResult(
                 code='P1', name='底面平台', category='precheck',
                 passed=False, score=0,
-                detail=f'底面接触顶点不足 ({bottom_mask.sum()} 个)，无法计算接触面积',
-                metrics=metrics,
+                detail='模型仅以点或边接触平台，没有可承载的平面区域',
+                metrics={**metrics, 'bottom_face_count': 0,
+                         'contact_area': 0.0},
             ))
             return
 
-        bottom_pts = mesh.vertices[bottom_mask, :2]  # XY 投影
-        try:
-            from scipy.spatial import ConvexHull
-            hull = ConvexHull(bottom_pts)
-            contact_area = float(hull.volume)  # 2D convex hull area
-        except Exception:
-            # 退化情况（点共线/重合）→ 接触面积为 0
-            contact_area = 0.0
-
+        contact_area = float(
+            np.sum(mesh.area_faces[bottom_faces]
+                   * np.abs(mesh.face_normals[bottom_faces, 2]))
+        )
         metrics['contact_area'] = contact_area
+        metrics['bottom_face_count'] = bottom_count
 
         if contact_area < min_area:
             report.results.append(CheckResult(
@@ -369,6 +448,96 @@ class DFMChecker:
                 code='P1', name='底面平台', category='precheck',
                 passed=True, score=100,
                 detail=f'底面接触面积 {contact_area:.1f}mm² ≥ {min_area}mm²',
+                metrics=metrics,
+            ))
+
+    # ── P3: 静态稳定性 ────────────────────────────────
+
+    def _check_stability(self, mesh: trimesh.Trimesh,
+                         report: DFMReport):
+        """检查重心 XY 投影是否位于真实底面支撑凸包的安全裕量内。"""
+        min_z = float(mesh.vertices[:, 2].min())
+        eps = max(float(self.rules.get('z_tolerance', 1e-5)), 1e-5)
+        required_margin = float(self.rules.get('stability_margin_mm', 1.0))
+        face_z = mesh.vertices[mesh.faces][:, :, 2]
+        bottom_faces = np.all(np.abs(face_z - min_z) <= eps, axis=1)
+        support_points = np.unique(
+            mesh.vertices[mesh.faces[bottom_faces]].reshape(-1, 3)[:, :2], axis=0,
+        ) if np.any(bottom_faces) else np.empty((0, 2))
+
+        if len(support_points) < 3:
+            self._append_na(
+                report, 'P3', '静态稳定性', 'precheck',
+                '没有可形成支撑多边形的真实底面；由 P1 处理点/边接触问题',
+                metrics={'support_point_count': int(len(support_points))},
+            )
+            return
+
+        try:
+            from scipy.spatial import ConvexHull
+
+            hull = ConvexHull(support_points)
+            equations = np.asarray(hull.equations, dtype=float)
+            support_area = float(hull.volume)  # 二维 ConvexHull.volume 即面积
+        except Exception as exc:
+            self._append_unknown(
+                report, 'P3', '静态稳定性', 'precheck',
+                f'支撑多边形计算未完成: {exc}', blocking=True,
+            )
+            return
+
+        center_source = 'volume_center_mass'
+        try:
+            if mesh.is_volume:
+                center = np.asarray(mesh.center_mass, dtype=float)
+            else:
+                center = np.asarray(mesh.centroid, dtype=float)
+                center_source = 'surface_centroid'
+        except Exception:
+            center = np.asarray(mesh.centroid, dtype=float)
+            center_source = 'surface_centroid'
+        if center.shape != (3,) or not np.all(np.isfinite(center)):
+            center = np.asarray(mesh.centroid, dtype=float)
+            center_source = 'surface_centroid'
+        if center.shape != (3,) or not np.all(np.isfinite(center)):
+            self._append_unknown(
+                report, 'P3', '静态稳定性', 'precheck',
+                '模型重心无法可靠计算', blocking=True,
+            )
+            return
+
+        normals = equations[:, :2]
+        offsets = equations[:, 2]
+        normal_lengths = np.linalg.norm(normals, axis=1)
+        signed_distances = -(
+            normals @ center[:2] + offsets
+        ) / np.maximum(normal_lengths, 1e-12)
+        stability_margin = float(signed_distances.min())
+        metrics = {
+            'center_x_mm': float(center[0]),
+            'center_y_mm': float(center[1]),
+            'center_source': center_source,
+            'support_area_mm2': support_area,
+            'stability_margin_mm': stability_margin,
+            'required_margin_mm': required_margin,
+        }
+
+        if stability_margin < required_margin:
+            report.results.append(CheckResult(
+                code='P3', name='静态稳定性', category='precheck',
+                passed=False,
+                score=max(0.0, min(100.0, stability_margin / required_margin * 100.0)),
+                detail=(
+                    f'重心投影安全裕量 {stability_margin:.2f}mm '
+                    f'< {required_margin:.2f}mm，存在倾倒风险'
+                ),
+                metrics=metrics,
+            ))
+        else:
+            report.results.append(CheckResult(
+                code='P3', name='静态稳定性', category='precheck',
+                passed=True, score=100,
+                detail=f'重心投影位于支撑区内，安全裕量 {stability_margin:.2f}mm',
                 metrics=metrics,
             ))
 
@@ -579,17 +748,57 @@ class DFMChecker:
         # 按面积排序，主体为最大分量
         areas = [c.area for c in components]
         total_area = sum(areas)
-        main_area = max(areas)
-        small = [(i, a) for i, a in enumerate(areas) if a < main_area * 0.01]
+        bed_tol = max(float(self.rules.get('z_tolerance', 1e-5)), 1e-5)
+        touching_platform = [
+            float(component.bounds[0, 2]) <= bed_tol
+            for component in components
+        ]
+        platform_indices = [
+            index for index, touching in enumerate(touching_platform) if touching
+        ]
+        main_idx = (
+            max(platform_indices, key=lambda index: areas[index])
+            if platform_indices else int(np.argmax(areas))
+        )
+        main_area = float(areas[main_idx])
+        fragment_ratio = float(self.rules.get('fragment_max_ratio', 0.01))
+        fragment_area = float(self.rules.get('fragment_max_area_mm2', 10.0))
+        fragment_extent = float(self.rules.get('fragment_max_extent_mm', 2.0))
+        small = [
+            (i, a) for i, (a, component) in enumerate(zip(areas, components))
+            if (
+                a < main_area * fragment_ratio
+                and a < fragment_area
+                and float(np.max(component.extents)) < fragment_extent
+            )
+        ]
         frag_count = len(small)
+        floating = [
+            index for index, touching in enumerate(touching_platform)
+            if not touching
+        ]
 
         metrics = {
             'component_count': len(components),
+            'main_component_index': int(main_idx),
             'total_area': float(total_area),
             'fragment_count': frag_count,
+            'fragment_candidate_indices': [index for index, _ in small],
+            'fragment_max_ratio': fragment_ratio,
+            'fragment_max_area_mm2': fragment_area,
+            'fragment_max_extent_mm': fragment_extent,
+            'floating_component_count': len(floating),
+            'floating_component_indices': floating[:20],
         }
 
-        if frag_count > 0:
+        if floating:
+            report.results.append(CheckResult(
+                code='G6', name='孤立碎面', category='topology',
+                passed=False, score=0,
+                detail=f'发现 {len(floating)} 个未接触打印平台的悬空连通分量',
+                metrics=metrics,
+            ))
+        elif frag_count > 0:
             frag_total = sum(a for _, a in small)
             report.results.append(CheckResult(
                 code='G6', name='孤立碎面', category='topology',
@@ -759,10 +968,7 @@ class DFMChecker:
 
     def _check_lattice_wall(self, mesh: trimesh.Trimesh,
                             report: DFMReport):
-        """镂空点阵壁厚检测（简化版：检查是否有极薄区域）。
-
-        完整 SDF 体素化方案待 CuraEngine 集成后实施，当前用射线法近似。
-        """
+        """镂空点阵壁厚尚未实现，明确返回 UNKNOWN。"""
         report.results.append(CheckResult(
             code='W4', name='镂空点阵壁厚', category='wall',
             status=CheckStatus.UNKNOWN, score=None,
@@ -774,98 +980,13 @@ class DFMChecker:
 
     def _check_cavity(self, mesh: trimesh.Trimesh,
                       report: DFMReport):
-        """SDF 体素法检测完全封闭空腔。"""
+        """封闭空腔空域洪泛尚未实现，明确返回 UNKNOWN。"""
         self._append_unknown(
             report, 'C1', '封闭空腔', 'cavity',
             '封闭空腔需对“空域”体素做边界洪泛；原算法检测的是实体内部，已停用',
             blocking=False,
         )
         return
-        min_vol = self.rules.get('min_cavity_volume', 1.0)
-        pitch = self.rules.get('sdf_pitch', 1.5)
-        try:
-            from scipy import ndimage
-            bounds = mesh.bounds
-            size = bounds[1] - bounds[0]
-            # 安全限制：网格点数不超过 500K，自动增大 pitch
-            max_voxels = 500_000
-            est_voxels = (size[0] / pitch) * (size[1] / pitch) * (size[2] / pitch)
-            if est_voxels > max_voxels:
-                pitch = max(pitch, (size[0] * size[1] * size[2] / max_voxels) ** (1 / 3))
-            axes = [np.arange(bounds[0, i] + pitch / 2,
-                              bounds[1, i], pitch) for i in range(3)]
-            if any(len(a) == 0 for a in axes):
-                report.results.append(CheckResult(
-                    code='C1', name='封闭空腔', category='cavity',
-                    passed=True, score=100,
-                    detail=f'模型尺寸过小，无法以 pitch={pitch}mm 体素化',
-                ))
-                return
-            grid = np.stack(np.meshgrid(*axes, indexing='ij'), axis=-1)
-            pts = grid.reshape(-1, 3)
-            # SDF: 内部为负
-            sdf = -trimesh.proximity.signed_distance(mesh, pts)
-            interior = sdf < 0
-            if interior.sum() == 0:
-                report.results.append(CheckResult(
-                    code='C1', name='封闭空腔', category='cavity',
-                    passed=True, score=100,
-                    detail='未检测到内部空腔',
-                    metrics={'cavity_count': 0},
-                ))
-                return
-            # 3D 连通域
-            shape = tuple(len(a) for a in axes)
-            labels, n = ndimage.label(interior.reshape(shape))
-            # 排除触及边界的连通域（半开放凹槽/外部）
-            cavity_count = 0
-            cavities = []
-            for lid in range(1, n + 1):
-                mask = labels == lid
-                voxel_count = int(mask.sum())
-                volume = voxel_count * pitch ** 3
-                if volume < min_vol:
-                    continue
-                # 检查是否触及体素网格边界（6面任一）
-                touches_boundary = (
-                    mask[0, :, :].any() or mask[-1, :, :].any()
-                    or mask[:, 0, :].any() or mask[:, -1, :].any()
-                    or mask[:, :, 0].any() or mask[:, :, -1].any()
-                )
-                if not touches_boundary:
-                    cavity_count += 1
-                    coords = np.argwhere(mask)
-                    center = (coords.mean(axis=0) * pitch
-                              + [axes[i][0] for i in range(3)])
-                    cavities.append({
-                        'volume': round(volume, 2),
-                        'center': [round(float(c), 1) for c in center],
-                    })
-        except Exception as e:
-            report.results.append(CheckResult(
-                code='C1', name='封闭空腔', category='cavity',
-                passed=False, score=50,
-                detail=f'空腔 SDF 检测异常: {e}',
-            ))
-            return
-
-        if cavity_count > 0:
-            total_v = sum(c['volume'] for c in cavities)
-            report.results.append(CheckResult(
-                code='C1', name='封闭空腔', category='cavity',
-                passed=False, score=max(0, 100 - cavity_count * 20),
-                detail=f'发现 {cavity_count} 个封闭空腔（总体积 {total_v:.1f}mm³），需排液/排气',
-                metrics={'cavity_count': cavity_count,
-                         'total_volume': round(total_v, 1),
-                         'cavities': cavities},
-            ))
-        else:
-            report.results.append(CheckResult(
-                code='C1', name='封闭空腔', category='cavity',
-                passed=True, score=100,
-                detail='无封闭空腔',
-                metrics={'cavity_count': 0},
-            ))
 
     # ── C2: 排液孔（光固化） ───────────────────────────
 
@@ -885,180 +1006,39 @@ class DFMChecker:
 
     def _check_bridging(self, mesh: trimesh.Trimesh,
                         report: DFMReport):
-        """简化桥接检测：检查层间悬空截面跨度。"""
+        """层间桥接检测尚未实现，明确返回 UNKNOWN。"""
         self._append_unknown(
             report, 'S2', '桥接检测', 'overhang',
             '桥接跨度需比较相邻层支撑区域；整层截面宽度不能代表桥接，原算法已停用',
             blocking=False,
         )
         return
-        max_span = self.rules.get('bridge_max_span', 15.0)
-        try:
-            bbox = mesh.bounds
-            h = bbox[1, 2] - bbox[0, 2]
-            layer_h = self.rules.get('layer_height', 0.2)
-            n_slices = max(5, int(h / (layer_h * 5)))  # 每5层抽检一次
-            max_gap = 0.0
-            for z in np.linspace(bbox[0, 2] + layer_h, bbox[1, 2], n_slices):
-                s = mesh.section(plane_origin=[0, 0, z],
-                                 plane_normal=[0, 0, 1])
-                if s is None:
-                    continue
-                # 取截面轮廓的 AABB 最长边作为桥接跨度近似
-                sb = s.bounds
-                span = max(sb[1, 0] - sb[0, 0], sb[1, 1] - sb[0, 1])
-                max_gap = max(max_gap, span)
-            metrics = {'max_span': round(float(max_gap), 1),
-                       'bridge_limit': max_span}
-        except Exception as e:
-            report.results.append(CheckResult(
-                code='S2', name='桥接检测', category='overhang',
-                passed=True, score=80,
-                detail=f'桥接分析异常: {e}',
-            ))
-            return
 
-        if max_gap > max_span:
-            report.results.append(CheckResult(
-                code='S2', name='桥接检测', category='overhang',
-                passed=False, score=max(0, 100 - (max_gap - max_span) * 5),
-                detail=f'最大桥接跨度 {max_gap:.1f}mm > {max_span}mm → 拉丝/塌陷风险',
-                metrics=metrics,
-            ))
-        else:
-            report.results.append(CheckResult(
-                code='S2', name='桥接检测', category='overhang',
-                passed=True, score=100,
-                detail=f'最大截面跨度 {max_gap:.1f}mm <= {max_span}mm',
-                metrics=metrics,
-            ))
-
-    # ── S3: 悬空孤岛 ──────────────────────────────────
+   # ── S3: 悬空孤岛 ──────────────────────────────────
 
     def _check_floating_islands(self, mesh: trimesh.Trimesh,
                                 report: DFMReport):
-        """分层切片 + XY 重叠检测悬空孤岛。
-
-        仅当新增轮廓在上一层无重叠 XY 区域时才判定为孤岛，
-        避免复杂模型的自然轮廓变化引起误报。
-        """
+        """层间悬空孤岛检测尚未实现，明确返回 UNKNOWN。"""
         self._append_unknown(
             report, 'S3', '悬空孤岛', 'overhang',
             '需使用层面积与下层膨胀支撑区域的差集；当前轮廓算法会漏掉断层后的孤岛，已停用',
             blocking=False,
         )
         return
-        try:
-            bbox = mesh.bounds
-            h = bbox[1, 2] - bbox[0, 2]
-            layer_h = self.rules.get('layer_height', 0.2)
-            n_slices = max(10, int(h / layer_h))
-            prev_polygons = []  # 上一层的多边形列表（Shapely）
-            island_count = 0
-            island_zs = []
-            for z in np.linspace(bbox[0, 2], bbox[1, 2], n_slices):
-                s = mesh.section(plane_origin=[0, 0, z],
-                                 plane_normal=[0, 0, 1])
-                if s is None:
-                    prev_polygons = []
-                    continue
-                try:
-                    planar, _ = s.to_planar()
-                    cur_polygons = list(planar.polygons_full)
-                except Exception:
-                    cur_polygons = []
-                # 检查当前层每个轮廓是否与上层有 XY 重叠
-                for poly in cur_polygons:
-                    if poly.is_empty:
-                        continue
-                    has_support = any(
-                        poly.intersects(prev) or poly.within(prev)
-                        for prev in prev_polygons
-                    ) if prev_polygons else True  # 第一层假支撑
-                    if not has_support:
-                        island_count += 1
-                        island_zs.append(round(float(z), 1))
-                prev_polygons = cur_polygons
-            metrics = {'island_count': island_count,
-                       'island_z_layers': island_zs[:5]}
-        except Exception as e:
-            report.results.append(CheckResult(
-                code='S3', name='悬空孤岛', category='overhang',
-                passed=True, score=70,
-                detail=f'孤岛检测异常: {e}',
-            ))
-            return
 
-        if island_count > 0:
-            report.results.append(CheckResult(
-                code='S3', name='悬空孤岛', category='overhang',
-                passed=False, score=max(50, 100 - island_count * 15),
-                detail=f'检测到 {island_count} 个悬空孤岛（Z={island_zs[:3]}...），打印时坍塌',
-                metrics=metrics,
-            ))
-        else:
-            report.results.append(CheckResult(
-                code='S3', name='悬空孤岛', category='overhang',
-                passed=True, score=100,
-                detail='未检测到悬空孤岛',
-                metrics=metrics,
-            ))
-
-    # ── S4: 最小支撑接触面积 ──────────────────────────
+   # ── S4: 最小支撑接触面积 ──────────────────────────
 
     def _check_overhang_contact_area(self, mesh: trimesh.Trimesh,
                                      report: DFMReport):
-        """计算悬垂面在 XY 平面的投影面积，校验支撑接触是否充足。"""
+        """真实支撑接触面积需要支撑网格，当前返回 UNKNOWN。"""
         self._append_unknown(
             report, 'S4', '支撑接触面积', 'overhang',
             '必须在生成支撑后测量真实接触斑块；悬垂投影总面积不能替代接触面积',
             blocking=False,
         )
         return
-        min_contact = self.rules.get('min_contact_area', 3.0)
-        angle_threshold = self.rules.get('critical_angle', 45)
-        try:
-            normals = (mesh.face_normals if hasattr(mesh, 'face_normals')
-                       else mesh.vertex_normals)
-            cos_th = np.cos(np.radians(angle_threshold))
-            overhang = normals[:, 2] < cos_th
-            if overhang.sum() == 0:
-                report.results.append(CheckResult(
-                    code='S4', name='支撑接触面积', category='overhang',
-                    passed=True, score=100,
-                    detail='无悬垂面，无需支撑',
-                    metrics={'overhang_projected_area': 0.0},
-                ))
-                return
-            areas = (mesh.area_faces if hasattr(mesh, 'area_faces')
-                     else np.ones(len(normals)))
-            proj_area = float((areas * np.abs(normals[:, 2]) * overhang).sum())
-            metrics = {'overhang_projected_area': round(proj_area, 2),
-                       'min_contact_area': min_contact}
-        except Exception as e:
-            report.results.append(CheckResult(
-                code='S4', name='支撑接触面积', category='overhang',
-                passed=True, score=70,
-                detail=f'接触面积计算异常: {e}',
-            ))
-            return
 
-        if proj_area < min_contact:
-            report.results.append(CheckResult(
-                code='S4', name='支撑接触面积', category='overhang',
-                passed=False, score=max(0, proj_area / min_contact * 100),
-                detail=f'悬垂投影面积 {proj_area:.1f}mm² < {min_contact}mm²，支撑易脱落',
-                metrics=metrics,
-            ))
-        else:
-            report.results.append(CheckResult(
-                code='S4', name='支撑接触面积', category='overhang',
-                passed=True, score=100,
-                detail=f'悬垂投影面积 {proj_area:.1f}mm² >= {min_contact}mm²',
-                metrics=metrics,
-            ))
-
-    # ── S5: 支撑去除干涉 ───────────────────────────────
+   # ── S5: 支撑去除干涉 ───────────────────────────────
 
     def _check_support_interference(self, mesh: trimesh.Trimesh,
                                     report: DFMReport):
@@ -1074,83 +1054,15 @@ class DFMChecker:
 
     def _check_hole_diameter(self, mesh: trimesh.Trimesh,
                              report: DFMReport):
-        """分层切片 + Shapely 内轮廓检测最小内孔直径。"""
+        """任意方向内孔识别尚未实现，明确返回 UNKNOWN。"""
         self._append_unknown(
             report, 'D1', '内孔孔径', 'dimension',
             '任意方向内孔需要轴向识别；仅做水平切片会漏检或误测，当前不参与判定',
             blocking=False,
         )
         return
-        min_dia = self.rules.get('min_hole_diameter', 0.4)
-        try:
-            from shapely.geometry import Polygon
-            bbox = mesh.bounds
-            h = bbox[1, 2] - bbox[0, 2]
-            n_slices = max(5, int(h / 2))  # 每 2mm 一层
-            min_width = 999.0
-            for z in np.linspace(bbox[0, 2] + 0.1, bbox[1, 2] - 0.1, n_slices):
-                s = mesh.section(plane_origin=[0, 0, z],
-                                 plane_normal=[0, 0, 1])
-                if s is None:
-                    continue
-                try:
-                    planar, _ = s.to_planar()
-                    for poly in planar.polygons_full:
-                        for interior in poly.interiors:
-                            ip = Polygon(interior)
-                            if ip.is_empty:
-                                continue
-                            w = ip.minimum_rotated_rectangle
-                            ww = min(
-                                w.exterior.coords[1][0] - w.exterior.coords[0][0],
-                                w.exterior.coords[2][1] - w.exterior.coords[1][1],
-                                key=abs)
-                            ww = abs(ww)
-                            if 0 < ww < min_width:
-                                min_width = ww
-                except Exception:
-                    continue
-            min_width = min_width if min_width < 999.0 else 0.0
-            metrics = {'min_hole_diameter': round(float(min_width), 3),
-                       'nozzle_diameter': min_dia}
-        except ImportError:
-            report.results.append(CheckResult(
-                code='D1', name='内孔孔径', category='dimension',
-                passed=True, score=70,
-                detail='Shapely 未安装，跳过内孔检测；pip install shapely',
-            ))
-            return
-        except Exception as e:
-            report.results.append(CheckResult(
-                code='D1', name='内孔孔径', category='dimension',
-                passed=True, score=70,
-                detail=f'内孔分析异常: {e}',
-            ))
-            return
 
-        if min_width > 0 and min_width < min_dia:
-            report.results.append(CheckResult(
-                code='D1', name='内孔孔径', category='dimension',
-                passed=False, score=max(0, min_width / min_dia * 100),
-                detail=f'最小内孔 {min_width:.3f}mm < {min_dia}mm（喷嘴直径），打印堵死',
-                metrics=metrics,
-            ))
-        elif min_width == 0.0:
-            report.results.append(CheckResult(
-                code='D1', name='内孔孔径', category='dimension',
-                passed=True, score=100,
-                detail='未检测到内孔结构',
-                metrics=metrics,
-            ))
-        else:
-            report.results.append(CheckResult(
-                code='D1', name='内孔孔径', category='dimension',
-                passed=True, score=100,
-                detail=f'最小内孔 {min_width:.3f}mm >= {min_dia}mm',
-                metrics=metrics,
-            ))
-
-    # ── D2: 装配间隙 ──────────────────────────────────
+   # ── D2: 装配间隙 ──────────────────────────────────
 
     def _check_assembly_gap(self, mesh: trimesh.Trimesh,
                             report: DFMReport):
@@ -1277,19 +1189,24 @@ class DFMChecker:
                 'overhang_support': [], 'dimension_compliance': [],
                 'feature_structure': [], 'cavity': []}
 
-        cat_map = {
-            'topology': 'watertight_topology',
-            'wall': 'wall_thickness',
-            'overhang': 'overhang_support',
-            'cavity': 'cavity',
-            'dimension': 'dimension_compliance',
-            'precheck': 'watertight_topology',
-        }
-
         for r in results:
             if r.status not in (CheckStatus.PASS, CheckStatus.FAIL) or r.score is None:
                 continue
-            bucket = cat_map.get(r.category, 'feature_structure')
+            if r.code.startswith('G'):
+                bucket = 'watertight_topology'
+            elif r.code in {'W1', 'W4'}:
+                bucket = 'wall_thickness'
+            elif r.code in {'W2', 'W3'}:
+                bucket = 'feature_structure'
+            elif r.code.startswith('S') or r.code in {'P1', 'P3'}:
+                bucket = 'overhang_support'
+            elif r.code.startswith('D') or r.code == 'P2':
+                bucket = 'dimension_compliance'
+            elif r.code.startswith('C'):
+                bucket = 'cavity'
+            else:
+                # P0 是单位/输入准备步骤，不代表制造质量，不计入加权分。
+                continue
             dims[bucket].append(float(r.score))
 
         configured_weights = {

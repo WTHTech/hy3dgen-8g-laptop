@@ -18,7 +18,7 @@ class DFMRules:
 
     _SECTIONS = (
         "wall", "overhang", "cavity", "dimension",
-        "platform", "printer", "performance", "scoring",
+        "platform", "printer", "repair", "slicer", "performance", "scoring",
     )
     _PROCESSES = {"FDM", "SLA"}
     _POSITIVE_KEYS = {
@@ -28,6 +28,15 @@ class DFMRules:
         "sdf_pitch", "min_hole_diameter", "gap_threshold",
         "min_thread_pitch", "min_bottom_area", "wall_sample_count",
         "self_intersection_max_faces",
+        "merge_close_tolerance", "max_hole_edges", "meshfix_timeout_seconds",
+        "pedestal_margin_mm", "pedestal_thickness_mm",
+        "pedestal_attachment_overlap_mm", "pedestal_contact_band_mm",
+        "pedestal_max_dimension_mm", "pedestal_voxel_pitch_mm",
+        "pedestal_voxel_max_cells", "stability_margin_mm",
+        "fragment_max_area_mm2", "fragment_max_extent_mm",
+        "fragment_protect_distance_mm",
+        "repair_stage_timeout_seconds",
+        "cura_timeout_seconds", "filament_density_g_cm3",
     }
 
     def __init__(self, config_path=None):
@@ -101,11 +110,68 @@ class DFMRules:
         if not isinstance(angle, (int, float)) or isinstance(angle, bool) or not 0 < angle < 90:
             raise ValueError(f"critical_angle 必须在 (0, 90) 度内，实际为 {angle!r}")
 
+        pedestal_angle = flat.get("pedestal_taper_angle_deg")
+        if (
+            not isinstance(pedestal_angle, (int, float))
+            or isinstance(pedestal_angle, bool)
+            or not 0 < pedestal_angle <= 90
+        ):
+            raise ValueError(
+                "pedestal_taper_angle_deg 必须在 (0, 90] 度内，"
+                f"实际为 {pedestal_angle!r}"
+            )
+
+        pedestal_style = flat.get("pedestal_style")
+        if not isinstance(pedestal_style, str) or pedestal_style.strip().lower() not in {
+            "auto", "disc", "block",
+        }:
+            raise ValueError(
+                "pedestal_style 必须是 auto、disc 或 block，"
+                f"实际为 {pedestal_style!r}"
+            )
+
+        normalized_up_axis = flat.get("normalized_up_axis")
+        if (
+            not isinstance(normalized_up_axis, str)
+            or normalized_up_axis.strip().lower() not in {"x", "y", "z"}
+        ):
+            raise ValueError(
+                "normalized_up_axis 必须是 x、y 或 z，"
+                f"实际为 {normalized_up_axis!r}"
+            )
+
+        fragment_ratio = flat.get("fragment_max_ratio")
+        if (
+            not isinstance(fragment_ratio, (int, float))
+            or isinstance(fragment_ratio, bool)
+            or not 0 < fragment_ratio < 1
+        ):
+            raise ValueError(
+                "fragment_max_ratio 必须在 (0, 1) 内，"
+                f"实际为 {fragment_ratio!r}"
+            )
+
         ratio = flat.get("max_overhang_area_ratio")
         if not isinstance(ratio, (int, float)) or isinstance(ratio, bool) or not 0 <= ratio <= 1:
             raise ValueError(
                 f"max_overhang_area_ratio 必须在 [0, 1] 内，实际为 {ratio!r}"
             )
+
+        z_tolerance = flat.get("z_tolerance")
+        if (
+            isinstance(z_tolerance, bool)
+            or not isinstance(z_tolerance, (int, float))
+            or z_tolerance < 0
+        ):
+            raise ValueError(f"z_tolerance 必须是非负数，实际为 {z_tolerance!r}")
+
+        require_drain = flat.get("require_drain_hole")
+        if not isinstance(require_drain, bool):
+            raise ValueError("require_drain_hole 必须是布尔值")
+
+        allow_voxel = flat.get("pedestal_allow_voxel_fallback")
+        if not isinstance(allow_voxel, bool):
+            raise ValueError("pedestal_allow_voxel_fallback 必须是布尔值")
 
         volume = flat.get("build_volume")
         if (
@@ -118,6 +184,13 @@ class DFMRules:
         for key, weight in config.get("scoring", {}).items():
             if isinstance(weight, bool) or not isinstance(weight, (int, float)) or weight <= 0:
                 raise ValueError(f"评分权重 {key} 必须是正数")
+
+        for key in ("wall_sample_count", "self_intersection_max_faces",
+                    "max_hole_edges", "meshfix_timeout_seconds",
+                    "cura_timeout_seconds", "pedestal_voxel_max_cells"):
+            value = flat.get(key)
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise ValueError(f"{key} 必须是正整数")
 
     @property
     def process(self) -> str:
@@ -132,6 +205,23 @@ class DFMRules:
             if key in table:
                 return table[key]
         return default
+
+    def to_dict(self) -> dict[str, Any]:
+        """返回当前已应用工艺覆盖的独立配置副本。"""
+        return deepcopy(self._raw)
+
+    @classmethod
+    def from_dict(cls, config: dict[str, Any]) -> "DFMRules":
+        """从内存映射恢复规则，供隔离修复子进程复用同一配置。"""
+        if not isinstance(config, dict):
+            raise ValueError("DFM 配置必须是映射")
+        instance = cls.__new__(cls)
+        instance._path = Path("<memory>")
+        instance._base = deepcopy(config)
+        instance._raw = {}
+        instance._validate_structure(instance._base)
+        instance.set_process(str(instance._base.get("process", "FDM")))
+        return instance
 
     def __getitem__(self, key: str):
         value = self.get(key)
